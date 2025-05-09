@@ -7,102 +7,87 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import r2_score
 import openpyxl
-import os
 import base64
-from github import Github
+import requests
 import io
-import time
+import os
 
-# 配置页面
+# GitHub configuration
+GITHUB_USER = "Sharry2025"
+GITHUB_REPO = "suspensions"
+DATA_FILE = "data.xlsx"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # Get token from environment variables
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+# Configure page
 st.set_page_config(layout="wide", page_title="Pharmaceutical Formulation Analysis")
 
-# 全局变量
-GITHUB_REPO = "Sharry2025/suspensions"  # 你的GitHub用户名/仓库名
-DATA_FILE = "data.xlsx"   # 仓库中的文件名
+# Global variables
 TARGET_COL = "F40"
 FEATURES = [
     "Sulfadiazine (g)", "Glycerol (ml)", "Tragacanth gum (g)", 
     "CMC-Na (g)", "sodium citrate (g)", "Purified water (ml)"
 ]
 
-# 初始化GitHub API
-@st.cache_resource
-def get_github_client():
-    try:
-        if "GITHUB_TOKEN" not in st.secrets:
-            st.error("""
-            ❌ 未配置GitHub Token！请按以下步骤操作：
-            1. 确保已在Streamlit Cloud的Settings → Secrets中添加：
-               [secrets]
-               GITHUB_TOKEN = "你的Token"
-            2. 确保Token有repo权限
-            """)
-            return None
-        return Github(st.secrets["GITHUB_TOKEN"])
-    except Exception as e:
-        st.error(f"❌ GitHub连接失败: {str(e)}")
-        return None
+# GitHub API functions
+def get_file_sha():
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{DATA_FILE}"
+    response = requests.get(url, headers=HEADERS)
+    if response.status_code == 200:
+        return response.json()["sha"]
+    return None
 
-# 数据加载（从GitHub）
-@st.cache_data(ttl=300)  # 5分钟缓存
-def load_data():
-    try:
-        # 尝试从GitHub加载
-        g = get_github_client()
-        if g:
-            repo = g.get_repo(GITHUB_REPO)
-            contents = repo.get_contents(DATA_FILE)
-            file_data = base64.b64decode(contents.content)
-            df = pd.read_excel(io.BytesIO(file_data), engine='openpyxl')
-            return df.dropna()
-        
-        # 如果GitHub不可用，尝试从原始URL加载
-        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{DATA_FILE}"
-        df = pd.read_excel(raw_url, engine='openpyxl')
+def load_data_from_github():
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{DATA_FILE}"
+    response = requests.get(url, headers=HEADERS)
+    
+    if response.status_code == 200:
+        content = response.json()["content"]
+        decoded = base64.b64decode(content)
+        df = pd.read_excel(io.BytesIO(decoded), engine='openpyxl')
         return df.dropna()
-    except Exception as e:
-        st.warning(f"⚠️ 数据加载失败: {str(e)}，使用空数据框架")
-        return pd.DataFrame(columns=FEATURES + [TARGET_COL])
+    else:
+        # If file doesn't exist or can't be accessed, create empty DataFrame with columns
+        cols = FEATURES + [TARGET_COL]
+        return pd.DataFrame(columns=cols)
 
-# 保存数据到GitHub
-def save_to_github(df):
-    try:
-        g = get_github_client()
-        if not g:
-            return False
-            
-        repo = g.get_repo(GITHUB_REPO)
-        
-        # 检查文件是否存在
-        try:
-            contents = repo.get_contents(DATA_FILE)
-            sha = contents.sha
-        except:
-            sha = None  # 文件不存在时创建新文件
-            
-        # 生成Excel文件
-        output = io.BytesIO()
-        df.to_excel(output, index=False, engine='openpyxl')
-        excel_data = output.getvalue()
-        
-        # 提交更改
-        repo.update_file(
-            path=DATA_FILE,
-            message=f"Update {DATA_FILE} via Streamlit App",
-            content=excel_data,
-            sha=sha
-        )
-        return True
-    except Exception as e:
-        st.error(f"❌ 保存失败: {str(e)}")
-        return False
+def save_data_to_github(df):
+    # Convert DataFrame to Excel in memory
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False)
+    excel_data = output.getvalue()
+    
+    # Encode to base64
+    encoded = base64.b64encode(excel_data).decode()
+    
+    # Get current file SHA for update
+    sha = get_file_sha()
+    
+    # Prepare API request
+    url = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{DATA_FILE}"
+    data = {
+        "message": "Update data file from Streamlit app",
+        "content": encoded,
+        "sha": sha if sha else None  # If sha is None, GitHub will create a new file
+    }
+    
+    response = requests.put(url, headers=HEADERS, json=data)
+    return response.status_code == 200
 
-# 模型训练
+# Data loading with caching
+@st.cache_data
+def load_data():
+    return load_data_from_github()
+
+# Model training
 @st.cache_resource
 def train_model():
     df = load_data()
-    if len(df) < 10:
-        st.warning("⚠️ 至少需要10条数据训练模型")
+    if len(df) < 10:  # Don't train model if not enough data
         return None
     
     X = df[FEATURES]
@@ -128,31 +113,37 @@ def train_model():
     )
     
     grid_search.fit(X, y)
-    return grid_search.best_estimator_
+    best_model = grid_search.best_estimator_
+    
+    return best_model
 
-# 界面1: 数据分析
+# Interface 1: Data Analysis
 def show_data_analysis():
     st.header("📊 Data Analysis")
     df = load_data()
     
     if len(df) < 3:
-        st.warning("⚠️ 至少需要3条数据进行分析")
+        st.warning("Not enough data for analysis (minimum 3 records required)")
         return
     
+    # Show raw data
     with st.expander("View Raw Data"):
         st.dataframe(df)
     
+    # Correlation analysis
     st.subheader("Correlation Analysis")
     corr_matrix = df.corr().round(2)
+    
     fig, ax = plt.subplots(figsize=(10, 8))
     sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, ax=ax)
     st.pyplot(fig)
     
+    # Model training and evaluation
     model = train_model()
     if model:
         st.subheader("Model Information")
         
-        # 特征重要性
+        # Feature importance
         importance_df = pd.DataFrame({
             "Feature": FEATURES,
             "Importance": model.feature_importances_
@@ -164,13 +155,13 @@ def show_data_analysis():
             st.dataframe(importance_df)
         
         with col2:
-            # 计算R²分数
+            # Calculate R² score
             predictions = model.predict(df[FEATURES])
             r2 = r2_score(df[TARGET_COL], predictions)
             st.markdown("**Model Performance:**")
             st.metric(label="R² Score", value=f"{r2:.4f}")
             
-            # 绘制实际vs预测值
+            # Plot actual vs predicted
             fig, ax = plt.subplots()
             ax.scatter(df[TARGET_COL], predictions)
             ax.plot([0, 1], [0, 1], 'r--')
@@ -178,12 +169,12 @@ def show_data_analysis():
             ax.set_ylabel("Predicted F40")
             st.pyplot(fig)
 
-# 界面2: 数据管理
+# Interface 2: Data Management
 def show_data_management():
     st.header("📝 Data Management")
     df = load_data()
 
-    # 添加新数据
+    # Add new data
     st.subheader("Add New Data")
     new_data = {}
     cols = st.columns(3)
@@ -196,9 +187,15 @@ def show_data_management():
     if st.button("Add Data"):
         new_df = pd.DataFrame([new_data])
         df = pd.concat([df, new_df], ignore_index=True)
-        st.success("Data added to local cache! Click 'Save to GitHub' to persist.")
+        if save_data_to_github(df):
+            st.success("Data added successfully!")
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+        else:
+            st.error("Failed to save data to GitHub. Please check your GitHub token and permissions.")
     
-    # 数据删除功能
+    # Data deletion functionality
     st.subheader("Manage Existing Data")
     st.write("Select rows to delete:")
     
@@ -222,20 +219,15 @@ def show_data_management():
     
     if not selected_rows.empty and st.button("Delete Selected Rows"):
         df = df.drop(selected_rows.index)
-        st.success(f"Marked {len(selected_rows)} row(s) for deletion. Click 'Save to GitHub' to confirm.")
-    
-    # 保存到GitHub
-    if st.button("💾 Save to GitHub", type="primary"):
-        if save_to_github(df):
-            st.success("✅ Data saved to GitHub successfully!")
+        if save_data_to_github(df):
+            st.success(f"Deleted {len(selected_rows)} row(s)")
             st.cache_data.clear()
             st.cache_resource.clear()
-            time.sleep(1)
             st.rerun()
         else:
-            st.error("❌ Failed to save to GitHub")
+            st.error("Failed to save data to GitHub. Please check your GitHub token and permissions.")
 
-# 界面3: F40预测
+# Interface 3: F40 Prediction
 def show_prediction():
     st.header("🔮 F40 Prediction")
     model = train_model()
@@ -244,7 +236,7 @@ def show_prediction():
         st.warning("Model not trained yet (need at least 10 records)")
         return
     
-    # 输入参数
+    # Input parameters
     st.subheader("Input Parameters")
     input_data = {}
     cols = st.columns(3)
@@ -252,16 +244,16 @@ def show_prediction():
     for i, col in enumerate(FEATURES):
         input_data[col] = cols[i%3].number_input(col, value=0.0, key=f"pred_{col}")
     
-    # 预测
+    # Prediction
     if st.button("Predict F40"):
         input_df = pd.DataFrame([input_data])
         prediction = model.predict(input_df)[0]
-        prediction = np.clip(prediction, 0, 1)
+        prediction = np.clip(prediction, 0, 1)  # Ensure between 0-1
         
         st.subheader("Prediction Result")
         st.metric(label="Predicted F40", value=f"{prediction:.4f}")
         
-        # 显示特征贡献
+        # Show feature contributions
         st.subheader("Feature Contributions")
         contributions = model.feature_importances_ * input_df.values[0]
         contrib_df = pd.DataFrame({
@@ -272,7 +264,7 @@ def show_prediction():
         
         st.dataframe(contrib_df)
 
-# 主界面
+# Main interface
 def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio("Go to", ["Data Analysis", "Data Management", "F40 Prediction"])
